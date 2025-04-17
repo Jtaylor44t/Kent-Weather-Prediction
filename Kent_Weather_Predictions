@@ -1,1 +1,699 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import mean_squared_error, accuracy_score
+from sklearn.model_selection import train_test_split
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
 
+# Load the data
+def load_data(filepath):
+    print("Loading data...")
+    df = pd.read_csv(filepath)
+    print(f"Data loaded with {df.shape[0]} rows and {df.shape[1]} columns")
+    
+    # Display column names to debug
+    print(f"Columns in dataset: {df.columns.tolist()}")
+    
+    return df
+
+# Clean data by removing invalid rows and handling NaN values
+def clean_data(df):
+    print("\nCleaning data...")
+    
+    # Count initial NaN values in key columns
+    print("NaN values before cleaning:")
+    for col in ['localtime', 'temperature', 'weather_descriptions', 'wind_speed', 'humidity']:
+        if col in df.columns:
+            print(f"  {col}: {df[col].isna().sum()} NaN values")
+    
+    # Remove rows where all values are NaN
+    initial_rows = len(df)
+    df = df.dropna(how='all')
+    print(f"Removed {initial_rows - len(df)} completely empty rows")
+    
+    # Drop rows with NaN in critical columns
+    critical_cols = ['localtime', 'temperature']
+    df_clean = df.dropna(subset=critical_cols)
+    print(f"Removed {len(df) - len(df_clean)} rows with missing datetime or temperature")
+    
+    # Handle remaining NaNs in numeric columns by imputing with median
+    numeric_cols = ['wind_speed', 'pressure', 'humidity', 'cloudcover', 'feelslike', 'uv_index', 'visibility']
+    for col in numeric_cols:
+        if col in df_clean.columns:
+            nan_count = df_clean[col].isna().sum()
+            if nan_count > 0:
+                median_val = df_clean[col].median()
+                df_clean[col].fillna(median_val, inplace=True)
+                print(f"Filled {nan_count} NaN values in {col} with median ({median_val:.2f})")
+    
+    # Handle NaN in categorical columns
+    categorical_cols = ['weather_descriptions', 'wind_dir', 'is_day']
+    for col in categorical_cols:
+        if col in df_clean.columns:
+            nan_count = df_clean[col].isna().sum()
+            if nan_count > 0:
+                mode_val = df_clean[col].mode()[0]
+                df_clean[col].fillna(mode_val, inplace=True)
+                print(f"Filled {nan_count} NaN values in {col} with mode ({mode_val})")
+    
+    print(f"Final clean dataset: {len(df_clean)} rows")
+    return df_clean
+
+# Process the datetime columns
+def process_datetime(df):
+    print("\nProcessing datetime columns...")
+    
+    # Check format of localtime column
+    print(f"Sample localtime values: {df['localtime'].head(3).tolist()}")
+    
+    # Convert localtime to datetime - try multiple formats
+    try:
+        df['localtime'] = pd.to_datetime(df['localtime'], errors='coerce')
+    except:
+        print("Standard datetime conversion failed, trying multiple formats...")
+    
+    # Handle NaT values by trying alternative formats
+    nat_mask = df['localtime'].isna()
+    if nat_mask.sum() > 0:
+        # Try different formats for parsing dates
+        formats = ['%m/%d/%Y %H:%M:%S', '%m/%d/%Y %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M']
+        for fmt in formats:
+            if nat_mask.sum() > 0:
+                df.loc[nat_mask, 'localtime'] = pd.to_datetime(
+                    df.loc[nat_mask, 'localtime'], 
+                    format=fmt, 
+                    errors='coerce'
+                )
+                nat_mask = df['localtime'].isna()
+                print(f"After trying format {fmt}: {nat_mask.sum()} invalid dates remain")
+    
+    # Extract datetime features
+    df['hour'] = df['localtime'].dt.hour
+    df['dayofweek'] = df['localtime'].dt.dayofweek
+    df['day'] = df['localtime'].dt.day
+    df['month'] = df['localtime'].dt.month
+    df['year'] = df['localtime'].dt.year
+    
+    # Convert is_day to numeric
+    if 'is_day' in df.columns:
+        df['is_day_numeric'] = df['is_day'].apply(lambda x: 1 if str(x).lower() == 'yes' else 0)
+    
+    # Print date range
+    min_date = df['localtime'].min()
+    max_date = df['localtime'].max()
+    print(f"Clean date range: {min_date} to {max_date}")
+    
+    # Count records by year
+    year_counts = df['year'].value_counts().sort_index()
+    print("Records by year:")
+    print(year_counts)
+    
+    return df
+
+# Process weather descriptions
+def process_weather_descriptions(df):
+    print("\nProcessing weather descriptions...")
+    
+    if 'weather_descriptions' not in df.columns:
+        print("weather_descriptions column not found in dataset")
+        return df
+    
+    # Make a copy of the original column for debugging
+    df['original_descriptions'] = df['weather_descriptions'].copy()
+    
+    # Handle various formats
+    try:
+        # Check a few sample values
+        sample_vals = df['weather_descriptions'].dropna().sample(min(5, len(df))).tolist()
+        print(f"Sample weather_descriptions values: {sample_vals}")
+        
+        # Try to detect list format based on first non-null value
+        first_val = df['weather_descriptions'].dropna().iloc[0]
+        
+        if isinstance(first_val, str):
+            if first_val.startswith('[') and ']' in first_val:
+                # Handle JSON-like strings
+                print("Detected JSON-like strings in weather_descriptions")
+                
+                # Function to safely parse string representations of lists
+                def parse_weather_desc(x):
+                    if pd.isna(x):
+                        return ["Unknown"]
+                    if isinstance(x, list):
+                        return x
+                    if isinstance(x, str):
+                        try:
+                            if x.startswith('[') and ']' in x:
+                                # Remove any escape characters and parse
+                                clean_x = x.replace('\\', '')
+                                parsed = eval(clean_x)
+                                if isinstance(parsed, list):
+                                    return parsed
+                                else:
+                                    return [str(parsed)]
+                            else:
+                                return [x]
+                        except:
+                            return [x]
+                    return ["Unknown"]
+                
+                # Apply parsing
+                df['parsed_descriptions'] = df['weather_descriptions'].apply(parse_weather_desc)
+                
+                # Extract first description
+                df['weather_desc'] = df['parsed_descriptions'].apply(
+                    lambda x: x[0] if isinstance(x, list) and len(x) > 0 else "Unknown")
+            else:
+                # Simple string values
+                print("Detected plain strings in weather_descriptions")
+                df['weather_desc'] = df['weather_descriptions']
+        elif isinstance(first_val, list):
+            # Already in list format
+            print("Detected list objects in weather_descriptions")
+            df['weather_desc'] = df['weather_descriptions'].apply(
+                lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 
+                        (x if not pd.isna(x) else "Unknown"))
+        else:
+            # Default case
+            print(f"Unknown format in weather_descriptions (type: {type(first_val)})")
+            df['weather_desc'] = df['weather_descriptions'].astype(str).apply(
+                lambda x: x if not pd.isna(x) and x != 'nan' else "Unknown")
+        
+        # Verify results
+        unique_descs = df['weather_desc'].nunique()
+        top_descs = df['weather_desc'].value_counts().head(5).to_dict()
+        print(f"Unique weather descriptions: {unique_descs}")
+        print(f"Top weather_desc values: {top_descs}")
+        
+    except Exception as e:
+        print(f"Error processing weather descriptions: {e}")
+        # Create a default weather_desc column
+        df['weather_desc'] = "Unknown"
+    
+    return df
+
+# One-hot encode categorical variables
+def encode_categorical(df):
+    print("\nEncoding categorical variables...")
+    
+    # Save a copy of the weather_desc column before encoding
+    if 'weather_desc' in df.columns:
+        weather_desc_original = df['weather_desc'].copy()
+    else:
+        weather_desc_original = None
+        print("Warning: weather_desc column not found")
+    
+    # Check if the columns exist before encoding
+    categorical_cols = []
+    if 'weather_desc' in df.columns:
+        categorical_cols.append('weather_desc')
+    
+    if 'wind_dir' in df.columns:
+        categorical_cols.append('wind_dir')
+    else:
+        print("Warning: wind_dir column not found")
+    
+    # One-hot encode categorical variables
+    if categorical_cols:
+        # For weather descriptions, limit to top N most common to avoid too many columns
+        if 'weather_desc' in categorical_cols:
+            top_n = 15  # Adjust as needed
+            top_values = df['weather_desc'].value_counts().head(top_n).index
+            print(f"One-hot encoding only the top {top_n} weather descriptions")
+            
+            # Create "other" category for less common values
+            df['weather_desc'] = df['weather_desc'].apply(
+                lambda x: x if x in top_values else 'Other')
+        
+        # Encode categories
+        df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=False)
+        encoded_cols = [col for col in df_encoded.columns if any(col.startswith(c + '_') for c in categorical_cols)]
+        print(f"Encoded {len(categorical_cols)} categorical variables into {len(encoded_cols)} dummy variables")
+        
+        # Restore the original weather_desc column for model training
+        if weather_desc_original is not None:
+            df_encoded['weather_desc'] = weather_desc_original
+    else:
+        df_encoded = df.copy()
+        print("No categorical variables to encode")
+    
+    return df_encoded
+
+# Prepare features for modeling
+def prepare_features(df):
+    print("\nPreparing features for modeling...")
+    
+    # Features for temperature prediction
+    numeric_features = ['hour', 'dayofweek', 'month', 'year']
+    
+    # Add additional features if they exist
+    for col in ['wind_speed', 'humidity', 'pressure', 'cloudcover', 'feelslike', 'uv_index', 'visibility', 'is_day_numeric']:
+        if col in df.columns:
+            numeric_features.append(col)
+    
+    print(f"Selected features: {numeric_features}")
+    return numeric_features
+
+# Train temperature prediction model
+def train_temp_model(df, features):
+    print("\nTraining temperature prediction model...")
+    
+    # Select only rows with valid temperature data
+    df_temp = df.dropna(subset=['temperature'])
+    
+    # Select valid features (drop any that might have become NaN)
+    X = df_temp[features].dropna(axis=1)
+    available_features = X.columns.tolist()
+    print(f"Using features: {available_features}")
+    
+    y = df_temp['temperature']
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train model
+    temp_model = RandomForestRegressor(n_estimators=100, random_state=42)
+    temp_model.fit(X_train, y_train)
+    
+    # Evaluate model
+    y_pred = temp_model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    print(f"Temperature MSE: {mse:.4f}")
+    print(f"Temperature RMSE: {rmse:.4f} degrees")
+    
+    # Feature importance
+    feature_importance = pd.DataFrame({
+        'Feature': available_features,
+        'Importance': temp_model.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    print("\nTop 5 most important features for temperature prediction:")
+    print(feature_importance.head(5))
+    
+    return temp_model, available_features
+
+# Train weather description prediction model
+def train_weather_desc_model(df):
+    print("\nTraining weather description model...")
+    
+    # Check if weather_desc column exists
+    if 'weather_desc' not in df.columns:
+        print("Cannot train weather description model: weather_desc column not found")
+        return None, None, None
+    
+    # Select rows with valid weather descriptions
+    df_weather = df.dropna(subset=['weather_desc'])
+    df_weather = df_weather[df_weather['weather_desc'] != 'Unknown']
+    
+    # Count unique weather descriptions
+    unique_descs = df_weather['weather_desc'].nunique()
+    print(f"Found {unique_descs} unique weather descriptions for modeling")
+    
+    if unique_descs <= 1:
+        print("Need at least 2 unique weather descriptions to train classifier")
+        return None, None, None
+    
+    # Features for weather prediction
+    features = ['hour', 'dayofweek', 'month', 'year']
+    for col in ['temperature', 'wind_speed', 'humidity', 'pressure', 'cloudcover', 'is_day_numeric']:
+        if col in df_weather.columns:
+            features.append(col)
+    
+    # Select valid features
+    X = df_weather[features].dropna(axis=1)
+    available_features = X.columns.tolist()
+    y = df_weather['weather_desc']
+    
+    # Check if we have enough data
+    if len(X) < 20:
+        print(f"Insufficient data ({len(X)} rows) to train weather model")
+        return None, None, None
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    print(f"Training weather model on {len(X_train)} samples with {len(available_features)} features")
+    
+    # Train model
+    weather_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    weather_model.fit(X_train, y_train)
+    
+    # Evaluate model
+    y_pred = weather_model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Weather Description Accuracy: {accuracy:.4f}")
+    
+    # Class distribution
+    class_dist = y.value_counts().head(5)
+    print("\nTop 5 weather description classes:")
+    print(class_dist)
+    
+    return weather_model, available_features, df_weather['weather_desc'].unique()
+
+# Generate features for prediction
+def generate_future_features(target_date, df, temp_features, weather_features):
+    print(f"\nGenerating features for future date: {target_date}")
+
+    # Create a DataFrame with a single row for the target date
+    future_data = pd.DataFrame({
+        'localtime': [target_date],
+        'hour': [target_date.hour],
+        'dayofweek': [target_date.weekday()],  # Changed from dayofweek to weekday()
+        'day': [target_date.day],
+        'month': [target_date.month],
+        'year': [target_date.year],
+    })
+
+    # Add other required columns with default values
+    numeric_cols = ['wind_speed', 'humidity', 'pressure', 'cloudcover',
+                    'feelslike', 'uv_index', 'visibility']
+
+    # Use average values from the dataset for the same month and hour
+    for col in numeric_cols:
+        if col in df.columns:
+            # Get average for same month and hour
+            mask = (df['month'] == target_date.month) & (df['hour'] == target_date.hour)
+            avg_value = df.loc[mask, col].mean()
+
+            # If no data for same month/hour, use overall average
+            if pd.isna(avg_value):
+                avg_value = df[col].mean()
+
+            future_data[col] = avg_value
+
+    # Handle is_day based on hour
+    future_data['is_day'] = 'yes' if 6 <= target_date.hour <= 18 else 'no'
+    future_data['is_day_numeric'] = 1 if future_data['is_day'].iloc[0] == 'yes' else 0
+
+    # Return the right subset of features for each model
+    temp_future = future_data[temp_features].copy() if temp_features else None
+
+    # Predict temperature and add it to future_data
+    if temp_future is not None and 'temperature' in weather_features:
+        temp_model, available_temp_features = train_temp_model(df, temp_features)
+        predicted_temp = temp_model.predict(temp_future)[0]
+        future_data['temperature'] = predicted_temp
+
+    weather_future = future_data[weather_features].copy() if weather_features else None
+
+    return temp_future, weather_future
+
+# Find historical temperatures for same day and hour across years
+def get_historical_temps(df, target_date):
+    month = target_date.month
+    day = target_date.day
+    hour = target_date.hour
+    
+    print(f"\nFinding historical temperatures for {month}/{day} at {hour}:00")
+    print(f"Filtering from {len(df)} total records")
+    
+    # Check for strict matches first (same month and day)
+    month_day_matches = df[(df['month'] == month) & (df['day'] == day)]
+    print(f"Found {len(month_day_matches)} records with month={month}, day={day}")
+    
+    historical_temps = {}
+    historical_data = {}  # Store more details for visualization
+    
+    # Check data for each year from 2022 to 2024
+    for year in range(2022, 2025):
+        print(f"Searching for data from year {year}...")
+        year_data = month_day_matches[month_day_matches['year'] == year]
+        
+        if not year_data.empty:
+            print(f"  Found {len(year_data)} records for {year}")
+            
+            # Try exact hour match first
+            hour_match = year_data[year_data['hour'] == hour]
+            
+            if not hour_match.empty:
+                temp = hour_match['temperature'].iloc[0]
+                temp_row = hour_match.iloc[0]
+                historical_temps[year] = temp
+                historical_data[year] = {
+                    'temperature': temp,
+                    'humidity': temp_row.get('humidity', None),
+                    'wind_speed': temp_row.get('wind_speed', None),
+                    'datetime': temp_row['localtime'],
+                    'match_type': 'exact'
+                }
+                print(f"  Exact match found for {year} at hour {hour}: temp = {temp}")
+            else:
+                # If no exact hour match, try closest hour
+                if len(year_data) > 0:
+                    # Calculate hour difference
+                    year_data['hour_diff'] = abs(year_data['hour'] - hour)
+                    closest_match = year_data.loc[year_data['hour_diff'].idxmin()]
+                    temp = closest_match['temperature']
+                    closest_hour = closest_match['hour']
+                    historical_temps[year] = temp
+                    historical_data[year] = {
+                        'temperature': temp,
+                        'humidity': closest_match.get('humidity', None),
+                        'wind_speed': closest_match.get('wind_speed', None),
+                        'datetime': closest_match['localtime'],
+                        'match_type': f'closest hour ({closest_hour})'
+                    }
+                    print(f"  Closest match for {year} at hour {closest_hour}: temp = {temp}")
+                else:
+                    historical_temps[year] = None
+                    print(f"  No data for {year} on {month}/{day}")
+        else:
+            # If no exact day match, look for closest day in same month and year
+            month_year_data = df[(df['month'] == month) & (df['year'] == year)]
+            if not month_year_data.empty:
+                # Find closest day
+                month_year_data['day_diff'] = abs(month_year_data['day'] - day)
+                closest_day_match = month_year_data.loc[month_year_data['day_diff'].idxmin()]
+                temp = closest_day_match['temperature']
+                closest_day = closest_day_match['day']
+                historical_temps[year] = temp
+                historical_data[year] = {
+                    'temperature': temp,
+                    'humidity': closest_day_match.get('humidity', None),
+                    'wind_speed': closest_day_match.get('wind_speed', None),
+                    'datetime': closest_day_match['localtime'],
+                    'match_type': f'closest day ({month}/{closest_day})'
+                }
+                print(f"  Found closest day for {year}: {month}/{closest_day}, temp = {temp}")
+            else:
+                historical_temps[year] = None
+                print(f"  No data for {year} in month {month}")
+    
+    return historical_temps, historical_data
+
+# Visualize temperature trends
+def visualize_temperatures(historical_data, predicted_temp, target_date):
+    print("\nCreating temperature visualization...")
+    
+    # Set up the figure
+    plt.figure(figsize=(12, 8))
+    
+    # Plot historical temperatures
+    years = []
+    temps = []
+    markers = []
+    labels = []
+    
+    for year in range(2022, 2025):
+        if year in historical_data and historical_data[year].get('temperature') is not None:
+            years.append(year)
+            temps.append(historical_data[year]['temperature'])
+            
+            # Use different markers based on match type
+            if historical_data[year]['match_type'] == 'exact':
+                markers.append('o')  # Circle for exact match
+            elif 'closest hour' in historical_data[year]['match_type']:
+                markers.append('s')  # Square for closest hour
+            else:
+                markers.append('^')  # Triangle for closest day
+            
+            labels.append(f"{year} ({historical_data[year]['match_type']})")
+    
+    # Add prediction for future year
+    years.append(2025)
+    temps.append(predicted_temp)
+    markers.append('*')  # Star for prediction
+    labels.append("2025 (Predicted)")
+    
+    # Create the plot
+    for i in range(len(years)):
+        plt.scatter(years[i], temps[i], marker=markers[i], s=150, label=labels[i])
+    
+    # Add trend line if we have at least 2 data points
+    if len(years) >= 2:
+        z = np.polyfit(years, temps, 1)
+        p = np.poly1d(z)
+        plt.plot(years, p(years), "r--", alpha=0.7)
+    
+    # Connect the points
+    plt.plot(years, temps, 'b-', alpha=0.5)
+    
+    # Add labels and title
+    month_name = target_date.strftime('%B')
+    plt.xlabel('Year', fontsize=12)
+    plt.ylabel('Temperature (°F)', fontsize=12)
+    plt.title(f'Temperature Trend for {month_name} {target_date.day} at {target_date.hour}:00', fontsize=14)
+    
+    # Customize y-axis to show meaningful range
+    min_temp = min(temps) - 5
+    max_temp = max(temps) + 5
+    plt.ylim(min_temp, max_temp)
+    
+    # Add grid and legend
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=10)
+    
+    # Add text annotations with additional data
+    for i, year in enumerate(years):
+        if year < 2025 and 'humidity' in historical_data.get(year, {}):
+            humidity = historical_data[year].get('humidity')
+            wind = historical_data[year].get('wind_speed')
+            annotation = f"Humid: {humidity:.1f}%"
+            if wind is not None:
+                annotation += f"\nWind: {wind:.1f}"
+            plt.annotate(annotation, (year, temps[i]), 
+                         textcoords="offset points", 
+                         xytext=(0,10), 
+                         ha='center',
+                         fontsize=8)
+    
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig('temperature_trend.png')
+    print("Visualization saved as 'temperature_trend.png'")
+    plt.close()
+
+# Get user input for target date
+def get_target_date():
+    while True:
+        try:
+            # Get current date for default values
+            now = datetime.now()
+            
+            # Ask for date input
+            print("\n==== Target Date Selection ====")
+            print("Enter the date you want to analyze/predict:")
+            
+            year_input = input(f"Year (2022-2025) [default: {now.year}]: ").strip()
+            year = int(year_input) if year_input else now.year
+            
+            month_input = input(f"Month (1-12) [default: {now.month}]: ").strip()
+            month = int(month_input) if month_input else now.month
+            
+            day_input = input(f"Day (1-31) [default: {now.day}]: ").strip()
+            day = int(day_input) if day_input else now.day
+            
+            hour_input = input("Hour (0-23) [default: 12]: ").strip() 
+            hour = int(hour_input) if hour_input else 12
+            
+            # Validate inputs
+            if not (2022 <= year <= 2025):
+                print("Year must be between 2022 and 2025")
+                continue
+                
+            if not (1 <= month <= 12):
+                print("Month must be between 1 and 12")
+                continue
+                
+            if not (1 <= day <= 31):
+                print("Day must be between 1 and 31")
+                continue
+                
+            if not (0 <= hour <= 23):
+                print("Hour must be between 0 and 23")
+                continue
+            
+            # Try to create a valid date
+            try:
+                target_date = datetime(year, month, day, hour, 0)
+                print(f"\nSelected date: {target_date.strftime('%Y-%m-%d %H:%M')}")
+                return target_date
+            except ValueError as e:
+                print(f"Invalid date: {e}")
+                continue
+                
+        except ValueError:
+            print("Please enter valid numbers")
+
+# Main function
+def main():
+    # File path to your CSV
+    file_path = '/kaggle/input/kent-weather-2022-current/kent_weather.csv'  # Update this to your actual file path
+    
+    # Load and process data
+    df_raw = load_data(file_path)
+    df_clean = clean_data(df_raw)
+    df = process_datetime(df_clean)
+    df = process_weather_descriptions(df)
+    df_encoded = encode_categorical(df)
+    
+    # Prepare features and train models
+    temp_features = prepare_features(df_encoded)
+    temp_model, available_temp_features = train_temp_model(df_encoded, temp_features)
+    weather_model, available_weather_features, weather_classes = train_weather_desc_model(df_encoded)
+    
+    # Get target date from user
+    target_date = get_target_date()
+    print(f"Future time: {target_date}")
+    
+    # Generate features for the future date
+    temp_future, weather_future = generate_future_features(target_date, df, 
+                                                         available_temp_features, 
+                                                         available_weather_features)
+    
+    # Predict temperature
+    predicted_temp = None
+    if temp_model is not None and temp_future is not None:
+        predicted_temp = temp_model.predict(temp_future)[0]
+        print(f"\nPredicted Temperature for {target_date}: {predicted_temp:.2f}°F")
+    else:
+        print("Unable to predict temperature")
+    
+    # Predict weather description
+    if weather_model is not None and weather_future is not None:
+        try:
+            predicted_weather = weather_model.predict(weather_future)[0]
+            print(f"Predicted Weather Description for {target_date}: [\"{predicted_weather}\"]")
+            
+            # Get prediction probabilities
+            proba = weather_model.predict_proba(weather_future)[0]
+            top_indices = proba.argsort()[-3:][::-1]  # Top 3 predictions
+            
+            print("\nTop 3 possible weather conditions:")
+            for i in top_indices:
+                weather_type = weather_model.classes_[i]
+                probability = proba[i] * 100
+                print(f"  - {weather_type}: {probability:.1f}%")
+        except Exception as e:
+            print(f"Error predicting weather: {e}")
+    else:
+        print("Weather description model not available")
+    
+    # Get historical temperatures
+    historical_temps, historical_data = get_historical_temps(df, target_date)
+    
+    # Display results
+    print(f"\nTemperatures for {target_date.month}/{target_date.day} at {target_date.hour}:{target_date.minute}:")
+    for year in range(2022, 2025):
+        if year in historical_temps and historical_temps[year] is not None:
+            match_type = ""
+            if year in historical_data:
+                match_type = f" ({historical_data[year]['match_type']})"
+            print(f"{year}: {historical_temps[year]:.2f}°F{match_type}")
+        else:
+            print(f"{year}: No data found")
+    
+    if predicted_temp is not None:
+        print(f"2025 (Predicted): {predicted_temp:.2f}°F")
+    
+    # Create visualization
+    if predicted_temp is not None:
+        visualize_temperatures(historical_data, predicted_temp, target_date)
+
+if __name__ == "__main__":
+    main()
